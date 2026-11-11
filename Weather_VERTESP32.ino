@@ -191,12 +191,14 @@ XPT2046_Touchscreen ts(TOUCH_CS);
 
 bool calendarFullscreen = false;
 bool clockFullscreen = false;
+bool clockAnalogView = true;
 char cfTime[6] = "", cfSec[3] = "", cfDow[24] = "", cfDate[24] = "";
 int menuState = 0;
 int brightness = 100;
 int shownAlertState = -1;
 int calDisplayMonth = 1;
 int calDisplayYear = 2026;
+int calNotesPage = 0;
 
 bool touchTracking = false;
 int touchStartRawX = 0, touchCurrRawX = 0;
@@ -462,6 +464,15 @@ void displayCalendarFullscreen(int displayMonth, int displayYear) {
 
   u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
   String lbl = String(monthNames[displayMonth - 1]) + " " + String(displayYear);
+  int monthNoteCount = notesCountForCalendarMonth(displayMonth, displayYear);
+  int monthNotePages = (monthNoteCount + 2) / 3;
+  if (monthNotePages > 1) {
+    lbl += " [";
+    lbl += String(calNotesPage + 1);
+    lbl += "/";
+    lbl += String(monthNotePages);
+    lbl += "]";
+  }
   drawTextCentered(160, 20, lbl.c_str(), CYAN, BACKGROUND_COLOR);
 
   u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
@@ -515,7 +526,7 @@ void displayCalendarFullscreen(int displayMonth, int displayYear) {
 
   u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
   drawTextCentered(160, 232, "< свайп > мiсяць    тап  назад", GREY, BACKGROUND_COLOR);
-    notesDrawCalendar(displayMonth);
+    notesDrawCalendar(displayMonth, displayYear, calNotesPage);
 }
 
 bool httpGetOK(const String& url) {
@@ -957,23 +968,73 @@ void drawGear(int cx, int cy, uint16_t col, uint16_t bg) {
   tft.drawCircle(cx, cy, 6, col);
 }
 
+static const uint16_t MENU_CELLS[9] = {
+  0xF548, 0xEB29, 0xF548,
+  0xEB29, 0xF548, 0x5E5A,
+  0xF548, 0xFF7D, 0xEB29
+};
+
 void drawMenuButton() {
-  const int X = MENU_BTN_X, Y = MENU_BTN_Y, W = MENU_BTN_W, H = MENU_BTN_H;
-  // плитка з рамкою і м'якою тінню
+  const int X = MENU_BTN_X;
+  const int Y = MENU_BTN_Y;
+  const int W = MENU_BTN_W;
+  const int H = MENU_BTN_H;
+
+  // Плитка з рамкою і тінню
   tft.fillRoundRect(X, Y, W, H, 12, RGB565(22, 27, 42));
   tft.drawRoundRect(X, Y, W, H, 12, RGB565(110, 122, 150));
   tft.drawRoundRect(X + 1, Y + 1, W - 2, H - 2, 11, RGB565(52, 60, 82));
-  // сітка 3x3 із кольорових квадратиків
-  static const uint16_t cells[9] = { 0xF548, 0xEB29, 0xF548,
-                                     0xEB29, 0xF548, 0x5E5A,
-                                     0xF548, 0xFF7D, 0xEB29 };
-  const int cell = 15, gap = 4;
+
+  // Сітка 3×3 із кольорових квадратиків
+  const int cell = 15;
+  const int gap = 4;
   const int pad = (W - (3 * cell + 2 * gap)) / 2;
-  for (int r = 0; r < 3; r++) {
-    for (int c = 0; c < 3; c++) {
-      tft.fillRoundRect(X + pad + c * (cell + gap), Y + pad + r * (cell + gap), cell, cell, 3, cells[r * 3 + c]);
+
+  for (int row = 0; row < 3; row++) {
+    for (int col = 0; col < 3; col++) {
+      int x = X + pad + col * (cell + gap);
+      int y = Y + pad + row * (cell + gap);
+      int index = row * 3 + col;
+
+      tft.fillRoundRect(x, y, cell, cell, 3, MENU_CELLS[index]);
     }
   }
+}
+
+void animateMenuButton(unsigned long now) {
+  static const uint8_t path[9] = { 0, 1, 2, 5, 8, 7, 6, 3, 4 };
+  static unsigned long lastFrame = 0;
+  static int previous = -1;
+  static int step = 0;
+
+  if (now - lastFrame < 220UL) return;
+  lastFrame = now;
+
+  const int cell = 15;
+  const int gap = 4;
+  const int pad = (MENU_BTN_W - (3 * cell + 2 * gap)) / 2;
+
+  // Повертаємо попередній квадратик до його звичайного кольору.
+  if (previous >= 0) {
+    int row = previous / 3;
+    int col = previous % 3;
+    int x = MENU_BTN_X + pad + col * (cell + gap);
+    int y = MENU_BTN_Y + pad + row * (cell + gap);
+
+    tft.fillRoundRect(x, y, cell, cell, 3, MENU_CELLS[previous]);
+  }
+
+  // Білий контур — короткий «проблиск» на наступному квадратику.
+  int current = path[step];
+  int row = current / 3;
+  int col = current % 3;
+  int x = MENU_BTN_X + pad + col * (cell + gap);
+  int y = MENU_BTN_Y + pad + row * (cell + gap);
+
+  tft.drawRoundRect(x, y, cell, cell, 3, WHITE);
+
+  previous = current;
+  step = (step + 1) % 9;
 }
 
 void drawAlertStatus() {
@@ -1986,6 +2047,11 @@ void redrawMain() {
   }
 
   drawAlertStatus();
+  static const uint16_t MENU_CELLS[9] = {
+  0xF548, 0xEB29, 0xF548,
+  0xEB29, 0xF548, 0x5E5A,
+  0xF548, 0xFF7D, 0xEB29
+};
   drawMenuButton();
   displayCalendar();
 }
@@ -1999,91 +2065,383 @@ void returnToMain() {
   lastCalendarUpdate = millis();
 }
 
-void drawClockFull(bool force) {
-  time_t t = (time_t)timeClient.getEpochTime();
-  tm* ptm = gmtime(&t);
+static void drawCalendarCorners(const tm* ptm) {
+  const uint16_t window = RGB565(19, 43, 70);
+  const uint16_t tick = RGB565(115, 145, 177);
+  const char* weekdays[7] = { "НД", "ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ" };
+  const char* months[12] = { "СІЧ", "ЛЮТ", "БЕР", "КВІ", "ТРА", "ЧЕР", "ЛИП", "СЕР", "ВЕР", "ЖОВ", "ЛИС", "ГРУ" };
 
-  char hh[3], mm[3], ss[3];
-  snprintf(hh, sizeof(hh), "%02d", ptm->tm_hour);
-  snprintf(mm, sizeof(mm), "%02d", ptm->tm_min);
-  snprintf(ss, sizeof(ss), "%02d", ptm->tm_sec);
+  u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
+  tft.fillRoundRect(5, 207, 54, 20, 5, window);
+  tft.drawRoundRect(5, 207, 54, 20, 5, tick);
+  drawTextCentered(32, 221, weekdays[ptm->tm_wday], RGB565(105, 220, 245), window);
+  tft.fillRoundRect(261, 207, 54, 20, 5, window);
+  tft.drawRoundRect(261, 207, 54, 20, 5, tick);
+  drawTextCentered(288, 221, months[ptm->tm_mon], RGB565(255, 199, 105), window);
+}
+static void drawDialLabels() {
+  const int cx = 160;
+  const int cy = 120;
+  const uint16_t dial = RGB565(10, 27, 52);
+  const uint16_t silver = RGB565(190, 202, 214);
+  const char* nums[12] = { "12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11" };
+  const int nx[12] = { 160, 202, 231, 252, 231, 202, 160, 118, 89, 68, 89, 118 };
+  const int ny[12] = { 39, 51, 80, 120, 161, 190, 201, 190, 161, 120, 80, 51 };
 
-  char hm[6];
-  snprintf(hm, sizeof(hm), "%s:%s", hh, mm);
-
-  static unsigned long colonOffUntil = 0;
-  static bool lastShowColon = true;
-  bool secondChanged = (strcmp(cfSec, ss) != 0);
-  if (secondChanged) colonOffUntil = millis() + 150UL;
-  bool showColon = (long)(millis() - colonOffUntil) >= 0;
-
-  const char* dayNames[] = { "Недiля", "Понедiлок", "Вiвторок", "Середа", "Четвер", "П'ятниця", "Субота" };
-  const char* dow = dayNames[ptm->tm_wday];
-  const char* monthNames[] = { "січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня", "листопада", "грудня" };
-  char date[24];
-  snprintf(date, sizeof(date), "%d %s", ptm->tm_mday, monthNames[ptm->tm_mon]);
-
-  u8g2Fonts.setFont(u8g2_font_logisoso32_tn);
-  int digitW = u8g2Fonts.getUTF8Width("00");
-  int colonW = u8g2Fonts.getUTF8Width(":");
-  int startX = (320 - (3 * digitW + 2 * colonW)) / 2;
-
-  int hourX = startX;
-  int colon1X = hourX + digitW;
-  int minuteX = colon1X + colonW;
-  int colon2X = minuteX + digitW;
-  int secondX = colon2X + colonW;
-
-  bool hourChanged = force || cfTime[0] == '\0' || strncmp(cfTime, hh, 2) != 0;
-  bool minuteChanged = force || cfTime[0] == '\0' || strncmp(cfTime + 3, mm, 2) != 0;
-  bool secondsChanged = force || strcmp(cfSec, ss) != 0;
-
-  if (hourChanged) {
-    tft.fillRect(hourX - 2, 38, digitW + 4, 40, BACKGROUND_COLOR);
-    drawText(hourX, 70, hh, RED, BACKGROUND_COLOR);
+  u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
+  for (int i = 0; i < 12; i++) {
+    if (i == 3) continue;
+    uint16_t color = (i == 0 || i == 6) ? RGB565(255, 199, 105) : silver;
+    drawTextCentered(nx[i], ny[i] + 7, nums[i], color, dial);
   }
 
-  if (force || hourChanged || minuteChanged) {
-    tft.fillRect(colon1X, 38, colonW, 40, BACKGROUND_COLOR);
-    drawText(colon1X, 70, ":", CYAN, BACKGROUND_COLOR);
-  }
+  u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
+  drawTextCentered(cx, 64, "CASIO", RGB565(170, 215, 238), dial);
+  drawTextCentered(cx, 78, "QUARTZ", RGB565(135, 170, 198), dial);
+}
 
-  if (minuteChanged) {
-    tft.fillRect(minuteX - 2, 38, digitW + 4, 40, BACKGROUND_COLOR);
-    drawText(minuteX, 70, mm, RED, BACKGROUND_COLOR);
-  }
+static bool lineNearPoint(int x0, int y0, int x1, int y1, int px, int py, float radius) {
+  float dx = (float)(x1 - x0), dy = (float)(y1 - y0);
+  float len2 = dx * dx + dy * dy;
+  float t = len2 > 0 ? ((px - x0) * dx + (py - y0) * dy) / len2 : 0;
+  t = constrain(t, 0.0f, 1.0f);
+  float ex = x0 + t * dx - px, ey = y0 + t * dy - py;
+  return ex * ex + ey * ey <= radius * radius;
+}
 
-  if (secondsChanged || showColon != lastShowColon || force) {
-    tft.fillRect(colon2X, 38, colonW, 40, BACKGROUND_COLOR);
-    if (showColon) {
-      drawText(colon2X, 70, ":", CYAN, BACKGROUND_COLOR);
+static void restoreDialDetailsOnOldHands(int cx, int cy, int hx, int hy,
+                                         int mx, int my, int sx, int sy) {
+  const uint16_t dial = RGB565(10, 27, 52);
+  const uint16_t silver = RGB565(190, 202, 214);
+  const int nx[12] = { 160, 202, 231, 252, 231, 202, 160, 118, 89, 68, 89, 118 };
+  const int ny[12] = { 39, 51, 80, 120, 161, 190, 201, 190, 161, 120, 80, 51 };
+  const char* nums[12] = { "12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11" };
+  u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
+
+  for (int i = 0; i < 12; i++) {
+    if (i == 3) continue;
+    bool hit = lineNearPoint(cx, cy, hx, hy, nx[i], ny[i], 13) ||
+               lineNearPoint(cx, cy, mx, my, nx[i], ny[i], 13) ||
+               lineNearPoint(cx, cy, sx, sy, nx[i], ny[i], 13);
+    if (hit) {
+      uint16_t color = (i == 0 || i == 6) ? RGB565(255, 199, 105) : silver;
+      drawTextCentered(nx[i], ny[i] + 7, nums[i], color, dial);
     }
   }
 
-  if (secondsChanged) {
-    tft.fillRect(secondX - 2, 38, digitW + 4, 40, BACKGROUND_COLOR);
-    drawText(secondX, 70, ss, ORANGE, BACKGROUND_COLOR);
+  u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
+  if (lineNearPoint(cx, cy, hx, hy, 160, 64, 20) ||
+      lineNearPoint(cx, cy, mx, my, 160, 64, 20) ||
+      lineNearPoint(cx, cy, sx, sy, 160, 64, 20))
+    drawTextCentered(160, 64, "CASIO", RGB565(170, 215, 238), dial);
+  if (lineNearPoint(cx, cy, hx, hy, 160, 78, 22) ||
+      lineNearPoint(cx, cy, mx, my, 160, 78, 22) ||
+      lineNearPoint(cx, cy, sx, sy, 160, 78, 22))
+    drawTextCentered(160, 78, "QUARTZ", RGB565(135, 170, 198), dial);
+}
+static void drawAnalogDial() {
+  const int cx = 160;
+  const int cy = 120;
+  const uint16_t navy = RGB565(7, 18, 38);
+  const uint16_t dial = RGB565(10, 27, 52);
+  const uint16_t silver = RGB565(190, 202, 214);
+  const uint16_t tick = RGB565(115, 145, 177);
+
+  tft.fillScreen(navy);
+  // Великий металевий обідок майже на всю висоту екрана.
+  tft.fillCircle(cx, cy, 119, RGB565(80, 96, 116));
+  tft.drawCircle(cx, cy, 118, WHITE);
+  tft.fillCircle(cx, cy, 114, RGB565(28, 112, 66));  // зелений пояс
+  tft.fillCircle(cx, cy, 110, RGB565(160, 48, 55));  // червоний середній обід
+  tft.fillCircle(cx, cy, 106, RGB565(42, 56, 76));
+  tft.fillCircle(cx, cy, 102, dial);
+
+  // Хвилинна шкала та виразні годинні мітки.
+  for (int i = 0; i < 60; i++) {
+    float a = (i * 6.0f - 90.0f) * 0.01745329252f;
+    int r1 = (i % 5 == 0) ? 91 : 97;
+    int r2 = 101;
+    int x1 = cx + lroundf(cosf(a) * r1);
+    int y1 = cy + lroundf(sinf(a) * r1);
+    int x2 = cx + lroundf(cosf(a) * r2);
+    int y2 = cy + lroundf(sinf(a) * r2);
+    tft.drawLine(x1, y1, x2, y2, (i % 5 == 0) ? WHITE : tick);
   }
 
-  strlcpy(cfTime, hm, sizeof(cfTime));
-  strlcpy(cfSec, ss, sizeof(cfSec));
-  lastShowColon = showColon;
+  drawDialLabels();
 
-  if (force || strcmp(cfDate, date) != 0) {
-    tft.fillRect(0, 108, 320, 44, BACKGROUND_COLOR);
-    u8g2Fonts.setFont(u8g2_font_inr30_t_cyrillic);
-    drawTextCentered(160, 139, date, CYAN, BACKGROUND_COLOR);
-    strlcpy(cfDate, date, sizeof(cfDate));
+  // Тонке внутрішнє кільце.
+  tft.drawCircle(cx, cy, 87, RGB565(55, 82, 112));
+  tft.fillCircle(cx, cy, 4, silver);
+}
+
+static void drawClockHand(int x0, int y0, int x1, int y1, uint16_t color, int thickness) {
+  float dx = (float)(x1 - x0);
+  float dy = (float)(y1 - y0);
+  float length = sqrtf(dx * dx + dy * dy);
+  if (length < 1.0f) return;
+
+  float px = -dy / length;
+  float py = dx / length;
+  int half = thickness / 2;
+  for (int offset = -half; offset <= half; offset++) {
+    int ox = lroundf(px * offset);
+    int oy = lroundf(py * offset);
+    tft.drawLine(x0 + ox, y0 + oy, x1 + ox, y1 + oy, color);
+  }
+}
+static void drawDateWindow(int dayOfMonth) {
+  const int x = 229, y = 109, w = 37, h = 22;
+  tft.fillRoundRect(x - 2, y - 2, w + 4, h + 4, 3, RGB565(180, 194, 208));
+  tft.fillRect(x, y, w, h, RGB565(218, 226, 232));
+  tft.drawRect(x, y, w, h, RGB565(35, 48, 65));
+  char value[3];
+  snprintf(value, sizeof(value), "%02d", dayOfMonth);
+  u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
+  drawTextCentered(x + w / 2, y + 17, value, RGB565(10, 24, 40), RGB565(218, 226, 232));
+}
+
+static void drawClockAnalogFull(bool force) {
+  static bool faceDrawn = false;
+  static bool handsDrawn = false;
+  static int lastSecond = -1, lastMinute = -1, lastHour = -1, lastDay = -1;
+  static int oldHx, oldHy, oldMx, oldMy, oldSx, oldSy;
+
+  time_t t = (time_t)timeClient.getEpochTime();
+  tm* ptm = gmtime(&t);
+  if (!ptm) return;
+
+  if (force || !faceDrawn) {
+    drawAnalogDial();
+    faceDrawn = true;
+    handsDrawn = false;
+    lastSecond = lastMinute = lastHour = lastDay = -1;
+  }
+  if (!force && ptm->tm_sec == lastSecond) return;
+
+  const int cx = 160, cy = 120;
+  const uint16_t dial = RGB565(10, 27, 52);
+  const float deg = 0.01745329252f;
+  bool dateChanged = (lastDay != ptm->tm_mday);
+  if (dateChanged) {
+    drawCalendarCorners(ptm);
+    lastDay = ptm->tm_mday;
   }
 
-  if (force || strcmp(cfDow, dow) != 0) {
-    tft.fillRect(0, 185, 320, 45, BACKGROUND_COLOR);
-    u8g2Fonts.setFont(u8g2_font_inr30_t_cyrillic);
-    drawTextCentered(160, 215, dow, DARKGREEN, BACKGROUND_COLOR);
-    strlcpy(cfDow, dow, sizeof(cfDow));
+  float hourA = (((ptm->tm_hour % 12) + ptm->tm_min / 60.0f) * 30.0f - 90.0f) * deg;
+  float minA = (ptm->tm_min * 6.0f - 90.0f) * deg;
+  float secA = (ptm->tm_sec * 6.0f - 90.0f) * deg;
+  int hx = cx + lroundf(cosf(hourA) * 49), hy = cy + lroundf(sinf(hourA) * 49);
+  int mx = cx + lroundf(cosf(minA) * 68), my = cy + lroundf(sinf(minA) * 68);
+  int sx = cx + lroundf(cosf(secA) * 80), sy = cy + lroundf(sinf(secA) * 80);
+
+  bool hourChanged = !handsDrawn || ptm->tm_hour != lastHour || ptm->tm_min != lastMinute;
+  bool minuteChanged = !handsDrawn || ptm->tm_min != lastMinute;
+  // Стрілки годин і хвилин не треба перемальовувати на кожному тіку.
+  // Секундна стрілка проходить через їхню спільну вісь у центрі; втулка
+  // перемальовується нижче, тому це перетин не потребує стирання стрілок.
+  bool repaintHour = hourChanged;
+  bool repaintMinute = minuteChanged;
+  bool dateWasCovered = dateChanged || (handsDrawn && lineNearPoint(cx, cy, oldSx, oldSy, 247, 120, 24)) ||
+                        (handsDrawn && hourChanged && lineNearPoint(cx, cy, oldHx, oldHy, 247, 120, 24)) ||
+                        (handsDrawn && minuteChanged && lineNearPoint(cx, cy, oldMx, oldMy, 247, 120, 24));
+
+  if (handsDrawn) {
+    // Секундна стрілка змінюється щосекунди. Статичні стрілки стираються лише
+    // коли змінилася хвилина/година, або відновлюються при рідкісному перетині.
+    drawClockHand(cx, cy, oldSx, oldSy, dial, 1);
+    if (hourChanged) drawClockHand(cx, cy, oldHx, oldHy, dial, 9);
+    if (minuteChanged) drawClockHand(cx, cy, oldMx, oldMy, dial, 5);
+
+    int restoreHx = (hourChanged || repaintHour) ? oldHx : cx;
+    int restoreHy = (hourChanged || repaintHour) ? oldHy : cy;
+    int restoreMx = (minuteChanged || repaintMinute) ? oldMx : cx;
+    int restoreMy = (minuteChanged || repaintMinute) ? oldMy : cy;
+    restoreDialDetailsOnOldHands(cx, cy, restoreHx, restoreHy, restoreMx, restoreMy, oldSx, oldSy);
+  }
+
+  uint16_t hourColor = RGB565(163, 107, 42);
+  uint16_t hourHighlight = RGB565(255, 224, 157);
+  uint16_t minuteColor = RGB565(39, 119, 173);
+  uint16_t minuteHighlight = RGB565(225, 240, 248);
+  uint16_t secondColor = RGB565(255, 112, 45);
+  if (repaintHour) {
+    drawClockHand(cx, cy, hx, hy, hourColor, 9);
+    drawClockHand(cx, cy, hx, hy, hourHighlight, 5);
+  }
+  if (repaintMinute) {
+    drawClockHand(cx, cy, mx, my, minuteColor, 5);
+    drawClockHand(cx, cy, mx, my, minuteHighlight, 1);
+  }
+  drawClockHand(cx, cy, sx, sy, secondColor, 1);
+  tft.fillCircle(cx, cy, 5, RGB565(190, 202, 214));
+  tft.fillCircle(cx, cy, 2, secondColor);
+
+  if (dateWasCovered) drawDateWindow(ptm->tm_mday);
+
+  oldHx = hx; oldHy = hy; oldMx = mx; oldMy = my; oldSx = sx; oldSy = sy;
+  lastSecond = ptm->tm_sec;
+  lastMinute = ptm->tm_min;
+  lastHour = ptm->tm_hour;
+  handsDrawn = true;
+}
+
+static void drawClockViewButton() {
+  const uint16_t bg = RGB565(18, 48, 72);
+  tft.fillRoundRect(250, 5, 65, 29, 6, bg);
+  tft.drawRoundRect(250, 5, 65, 29, 6, RGB565(255, 199, 105));
+  u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
+  drawTextCentered(282, 24, "ВИГЛЯД", WHITE, bg);
+}
+
+static void drawClockDigitalFull(bool force) {
+  static char lastHour[3] = "";
+  static char lastMinute[3] = "";
+  static char lastDate[16] = "";
+  static int lastSecondTick = -1;
+  static bool screenDrawn = false;
+  static unsigned long colonOffAt = 0;
+  static bool colonVisible = false;
+  static bool colonDrawnOnScreen = false;
+
+  time_t t = (time_t)timeClient.getEpochTime();
+  tm* ptm = gmtime(&t);
+  if (!ptm) return;
+
+  if (force || !screenDrawn) {
+    tft.fillScreen(RGB565(7, 18, 38));
+    lastHour[0] = '\0';
+    lastMinute[0] = '\0';
+    lastDate[0] = '\0';
+    lastSecondTick = -1;
+    colonVisible = false;
+    colonDrawnOnScreen = false;
+    screenDrawn = true;
+  }
+
+  const uint16_t bg = RGB565(7, 18, 38);
+  const uint16_t fg = RGB565(235, 241, 245);
+  char hourText[3], minuteText[3], secondText[3];
+  snprintf(hourText, sizeof(hourText), "%02d", ptm->tm_hour);
+  snprintf(minuteText, sizeof(minuteText), "%02d", ptm->tm_min);
+  snprintf(secondText, sizeof(secondText), "%02d", ptm->tm_sec);
+
+  // Увесь час однакового великого розміру. Кожна пара цифр оновлюється
+  // лише тоді, коли змінюється, тому години й хвилини не блимають щосекунди.
+  u8g2Fonts.setFont(u8g2_font_logisoso62_tn);
+  const int digitW = u8g2Fonts.getUTF8Width("00");
+  const int sepW = 18;
+  const int fullW = digitW * 3 + sepW * 2;
+  const int startX = (320 - fullW) / 2;
+  const int hourX = startX;
+  const int hourColonX = hourX + digitW + (sepW - 4) / 2;
+  const int minuteX = hourX + digitW + sepW;
+  const int secondsColonX = minuteX + digitW + (sepW - 4) / 2;
+  const int secondX = minuteX + digitW + sepW;
+  const int timeBaseline = 121;
+
+  bool hourChanged = strcmp(lastHour, hourText) != 0;
+  bool minuteChanged = strcmp(lastMinute, minuteText) != 0;
+  if (hourChanged) {
+    tft.fillRect(hourX - 3, 35, digitW + 6, 94, bg);
+    u8g2Fonts.setFont(u8g2_font_logisoso62_tn);
+    u8g2Fonts.setBackgroundColor(bg);
+    u8g2Fonts.setForegroundColor(fg);
+    u8g2Fonts.setCursor(hourX, timeBaseline);
+    u8g2Fonts.print(hourText);
+    strlcpy(lastHour, hourText, sizeof(lastHour));
+  }
+  if (minuteChanged) {
+    tft.fillRect(minuteX - 3, 35, digitW + 6, 94, bg);
+    u8g2Fonts.setFont(u8g2_font_logisoso62_tn);
+    u8g2Fonts.setBackgroundColor(bg);
+    u8g2Fonts.setForegroundColor(fg);
+    u8g2Fonts.setCursor(minuteX, timeBaseline);
+    u8g2Fonts.print(minuteText);
+    strlcpy(lastMinute, minuteText, sizeof(lastMinute));
+  }
+  bool secondChanged = (ptm->tm_sec != lastSecondTick);
+  if (secondChanged) {
+    tft.fillRect(secondX - 3, 35, digitW + 6, 94, bg);
+    u8g2Fonts.setFont(u8g2_font_logisoso62_tn);
+    u8g2Fonts.setBackgroundColor(bg);
+    u8g2Fonts.setForegroundColor(RGB565(255, 199, 105));
+    u8g2Fonts.setCursor(secondX, timeBaseline);
+    u8g2Fonts.print(secondText);
+    lastSecondTick = ptm->tm_sec;
+    colonVisible = true;
+    colonOffAt = millis() + 180UL;
+  }
+
+  // Двокрапка між годинами й хвилинами постійна.
+  if (force || hourChanged || minuteChanged) {
+    tft.fillRect(hourX + digitW, 57, sepW, 48, bg);
+    tft.fillCircle(hourColonX + 2, 75, 3, RGB565(255, 199, 105));
+    tft.fillCircle(hourColonX + 2, 94, 3, RGB565(255, 199, 105));
+  }
+  if (colonVisible && (long)(millis() - colonOffAt) >= 0) colonVisible = false;
+  if (force || secondChanged || colonVisible != colonDrawnOnScreen) {
+    tft.fillRect(minuteX + digitW, 57, sepW, 48, bg);
+    if (colonVisible) {
+      tft.fillCircle(secondsColonX + 2, 75, 3, RGB565(255, 199, 105));
+      tft.fillCircle(secondsColonX + 2, 94, 3, RGB565(255, 199, 105));
+    }
+    colonDrawnOnScreen = colonVisible;
+  }
+
+  char dateText[16], dayText[3], monthText[3], yearText[5];
+  snprintf(dayText, sizeof(dayText), "%02d", ptm->tm_mday);
+  snprintf(monthText, sizeof(monthText), "%02d", ptm->tm_mon + 1);
+  snprintf(yearText, sizeof(yearText), "%04d", ptm->tm_year + 1900);
+  snprintf(dateText, sizeof(dateText), "%s.%s.%s", dayText, monthText, yearText);
+  if (strcmp(lastDate, dateText) != 0) {
+    tft.fillRect(20, 143, 280, 53, bg);
+    u8g2Fonts.setFont(u8g2_font_logisoso38_tn);
+    int dayW = u8g2Fonts.getUTF8Width(dayText);
+    int dotW = u8g2Fonts.getUTF8Width(".");
+    int monthW = u8g2Fonts.getUTF8Width(monthText);
+    int yearW = u8g2Fonts.getUTF8Width(yearText);
+    int dateW = dayW + dotW + monthW + dotW + yearW;
+    int dateX = 160 - dateW / 2;
+    u8g2Fonts.setBackgroundColor(bg);
+    u8g2Fonts.setForegroundColor(RGB565(120, 185, 255));  // число місяця: інший колір, ніж секунди
+    u8g2Fonts.setCursor(dateX, 184);
+    u8g2Fonts.print(dayText);
+    dateX += dayW;
+    u8g2Fonts.setForegroundColor(RGB565(190, 202, 214));
+    u8g2Fonts.setCursor(dateX, 184);
+    u8g2Fonts.print(".");
+    dateX += dotW;
+    u8g2Fonts.setForegroundColor(RGB565(72, 205, 190));
+    u8g2Fonts.setCursor(dateX, 184);
+    u8g2Fonts.print(monthText);
+    dateX += monthW;
+    u8g2Fonts.setForegroundColor(RGB565(190, 202, 214));
+    u8g2Fonts.setCursor(dateX, 184);
+    u8g2Fonts.print(".");
+    dateX += dotW;
+    u8g2Fonts.setForegroundColor(RGB565(155, 180, 205));
+    u8g2Fonts.setCursor(dateX, 184);
+    u8g2Fonts.print(yearText);
+    strlcpy(lastDate, dateText, sizeof(lastDate));
+  }
+
+  static int lastWeekday = -1;
+  if (force || lastWeekday != ptm->tm_wday) {
+    const char* weekdays[7] = { "НЕДІЛЯ", "ПОНЕДІЛОК", "ВІВТОРОК", "СЕРЕДА", "ЧЕТВЕР", "П'ЯТНИЦЯ", "СУБОТА" };
+    tft.fillRoundRect(82, 207, 156, 25, 6, RGB565(18, 48, 72));
+    tft.drawRoundRect(82, 207, 156, 25, 6, RGB565(75, 125, 155));
+    u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
+    drawTextCentered(160, 226, weekdays[ptm->tm_wday], RGB565(120, 220, 235), RGB565(18, 48, 72));
+    lastWeekday = ptm->tm_wday;
   }
 }
 
+void drawClockFull(bool force) {
+  if (clockAnalogView) drawClockAnalogFull(force);
+  else drawClockDigitalFull(force);
+  if (force) drawClockViewButton();
+}
 void restoreAfterAlarm() {
   if (calendarFullscreen) displayCalendarFullscreen(calDisplayMonth, calDisplayYear);
   else if (clockFullscreen) { tft.fillScreen(BACKGROUND_COLOR); drawClockFull(true); }
@@ -2388,6 +2746,7 @@ void setup() {
   calDisplayYear = currentYear;
 
   displayCalendar();
+  
   drawMenuButton();
 
   xTaskCreatePinnedToCore(alertTask, "alert", 16384, NULL, 1, &alertTaskHandle, 0);
@@ -2546,14 +2905,31 @@ void loop() {
               calDisplayYear--;
             }
           }
+          calNotesPage = 0;
           displayCalendarFullscreen(calDisplayMonth, calDisplayYear);
         } else {
-          calendarFullscreen = false;
-          returnToMain();
+          int tapX, tapY;
+          rawToScreen(touchCurrRawX, touchCurrRawY, tapX, tapY);
+          int noteCount = notesCountForCalendarMonth(calDisplayMonth, calDisplayYear);
+          if (tapY >= 203 && noteCount > 3) {
+            int pageCount = (noteCount + 2) / 3;
+            calNotesPage = (calNotesPage + 1) % pageCount;
+            displayCalendarFullscreen(calDisplayMonth, calDisplayYear);
+          } else {
+            calendarFullscreen = false;
+            returnToMain();
+          }
         }
       } else if (clockFullscreen) {
-        clockFullscreen = false;
-        returnToMain();
+        int sx, sy;
+        rawToScreen(touchCurrRawX, touchCurrRawY, sx, sy);
+        if (inRect(sx, sy, 248, 0, 319, 38)) {
+          clockAnalogView = !clockAnalogView;
+          drawClockFull(true);
+        } else {
+          clockFullscreen = false;
+          returnToMain();
+        }
       } else if (alertHistScreen) {
         alertHistScreen = false;
         returnToMain();
@@ -2576,6 +2952,7 @@ void loop() {
           calDisplayMonth = month();
           calDisplayYear = currentYear;
           calendarFullscreen = true;
+          calNotesPage = 0;
           displayCalendarFullscreen(calDisplayMonth, calDisplayYear);
         } else if (inRect(sx, sy, CLK_X1, CLK_Y1, CLK_X2, CLK_Y2)) {
           clockFullscreen = true;
@@ -2650,6 +3027,7 @@ void loop() {
 
   if (alertState != shownAlertState) drawAlertStatus();
 notesTick(now);
+animateMenuButton(now);
   if (timeClient.valid()) {
     if (!minuteSilenceActive && (now - lastNTPUpdate >= 60000UL || lastNTPUpdate == 0)) {
       updateNTPTime();
