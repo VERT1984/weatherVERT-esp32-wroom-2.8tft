@@ -41,6 +41,7 @@ extern long cachedTZ;         // зсув часового поясу, с
 extern volatile int alertState;
 extern bool alarmActive;
 extern int alarmKind;
+extern bool alarmDisplayYellow;
 
 static bool featNight = false;
 static int featLdr = 2000;
@@ -93,15 +94,20 @@ inline void featuresTick(unsigned long now) {
   // --- двоколірний світлодіод: тривога — червоний, спокійно — зелений ---
   int rDuty = 0, gDuty = 0;
   int st = alertState;
-  bool alarmNow = (st == 2) || (alarmActive && alarmKind == 1);
-  if (alarmNow) {
+  bool redAlarmNow = (alarmActive && alarmKind == 1) ? !alarmDisplayYellow : (st == 2);
+  bool yellowAlarmNow = (alarmActive && alarmKind == 1) ? alarmDisplayYellow : (st == 3);
+  if (redAlarmNow) {
     if (cfg.ledMode == 2) rDuty = 255;
     else if (cfg.ledMode == 1) rDuty = ((now / 500UL) % 2 == 0) ? 255 : 0;
-  } else if (st == 3) {  // жовтий рівень: червоний + частина зеленого = бурштиновий
+  } else if (yellowAlarmNow) {  // жовтий рівень: червоний + частина зеленого = бурштиновий
     rDuty = 230;
     gDuty = 250;
   } else if (st == 1 && cfg.ledCalm) {  // спокійно
-    gDuty = featNight ? 25 : 255;
+    gDuty = 255;
+  }
+  if (featNight) {
+    rDuty = rDuty * cfg.nightLedBr / 100;
+    gDuty = gDuty * cfg.nightLedBr / 100;
   }
   static int rLast = -1, gLast = -1;
   if (rDuty != rLast) {
