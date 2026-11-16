@@ -22,6 +22,7 @@ struct AppCfg {
   uint8_t pressMm;        // 1 — тиск у мм рт. ст., 0 — у гПа
   uint8_t nightOn;        // 1 — нічний режим увімкнено (22:00–07:00)
   uint8_t nightBr;        // яскравість вночі, %
+  uint8_t nightLedBr;     // яскравість LED вночі, %
   uint8_t autoBr;         // 1 — автояскравість за датчиком світла
   uint8_t ledMode;        // червоний при тривозі: 0 — вимк., 1 — блимає, 2 — світить
   uint8_t ledCalm;        // 1 — зелений світиться, коли спокійно
@@ -72,6 +73,7 @@ inline void cfgSave(const AppCfg& c) {
   p.putUChar("pm", c.pressMm);
   p.putUChar("no", c.nightOn);
   p.putUChar("nb", c.nightBr);
+  p.putUChar("nlb", c.nightLedBr);
   p.putUChar("ab", c.autoBr);
   p.putUChar("lm", c.ledMode);
   p.putUChar("lg", c.ledCalm);
@@ -95,6 +97,7 @@ inline void cfgLoad() {
   cfg.pressMm = 1;  // значення за замовчуванням
   cfg.nightOn = 1;
   cfg.nightBr = 15;
+  cfg.nightLedBr = 10;
   cfg.autoBr = 0;
   cfg.ledMode = 1;
   cfg.ledCalm = 1;
@@ -111,6 +114,7 @@ inline void cfgLoad() {
     cfg.pressMm = p.getUChar("pm", cfg.pressMm);
     cfg.nightOn = p.getUChar("no", cfg.nightOn);
     cfg.nightBr = constrain((int)p.getUChar("nb", cfg.nightBr), 3, 100);
+    cfg.nightLedBr = constrain((int)p.getUChar("nlb", cfg.nightLedBr), 0, 100);
     cfg.autoBr = p.getUChar("ab", cfg.autoBr);
     cfg.ledMode = p.getUChar("lm", cfg.ledMode);
     cfg.ledCalm = p.getUChar("lg", cfg.ledCalm);
@@ -165,6 +169,22 @@ inline void cfgSaveBg(int r, int g, int b) {
   p.putInt("bgr", r);
   p.putInt("bgg", g);
   p.putInt("bgb", b);
+  p.end();
+}
+
+// Окремі кольори фону повноекранних екранів (RGB565).
+inline uint16_t cfgLoadScreenBg(const char* key, uint16_t fallback) {
+  Preferences p;
+  if (!p.begin("ws", true)) return fallback;
+  uint16_t color = p.getUShort(key, fallback);
+  p.end();
+  return color;
+}
+
+inline void cfgSaveScreenBg(const char* key, uint16_t color) {
+  Preferences p;
+  if (!p.begin("ws", false)) return;
+  p.putUShort(key, color);
   p.end();
 }
 
