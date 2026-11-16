@@ -28,6 +28,37 @@ struct Note {
   uint8_t pad;
   uint16_t year;  // 0 — повторювати щороку (день народження)
   char text[64];
+  // Додані в кінці, щоб зберегти сумісність початкових полів старих заміток.
+  uint8_t reminderEnabled;
+  uint8_t reminderHour;
+  uint8_t reminderMinute;
+  uint8_t reminderPad;
+  uint32_t reminderFiredDay;  // YYYYMMDD — не повторювати після перезавантаження цього дня
+  uint8_t reminderRepeats;    // скільки разів програти сигнал: 1–3
+  uint8_t reminderReserved[3];
+};
+
+struct NoteLegacyV1 {
+  uint8_t used;
+  uint8_t day;
+  uint8_t month;
+  uint8_t pad;
+  uint16_t year;
+  char text[64];
+};
+
+struct NoteLegacyV2 {
+  uint8_t used;
+  uint8_t day;
+  uint8_t month;
+  uint8_t pad;
+  uint16_t year;
+  char text[64];
+  uint8_t reminderEnabled;
+  uint8_t reminderHour;
+  uint8_t reminderMinute;
+  uint8_t reminderPad;
+  uint32_t reminderFiredDay;
 };
 
 static Note notes[NOTES_MAX];
@@ -36,15 +67,60 @@ extern Adafruit_ILI9341 tft;            // визначено в скетчі
 extern U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;  // визначено в скетчі
 extern uint16_t bgColor;
 extern char lastDayOfWeek[24];
+extern volatile bool notesBeepRequest;
+extern volatile uint8_t notesBeepRepeatsRequest;
 
 // ---------- збереження ----------
+inline void notesSave();
+
 inline void notesLoad() {
   memset(notes, 0, sizeof(notes));
   Preferences p;
   if (!p.begin("notes", false)) return;
-  if (p.getBytesLength("n") == sizeof(notes)) p.getBytes("n", notes, sizeof(notes));
+  size_t stored = p.getBytesLength("n");
+  bool migrated = false;
+  if (stored == sizeof(notes)) {
+    p.getBytes("n", notes, sizeof(notes));
+  } else if (stored == sizeof(NoteLegacyV2) * NOTES_MAX) {
+    static NoteLegacyV2 oldNotes[NOTES_MAX];
+    if (p.getBytes("n", oldNotes, sizeof(oldNotes)) == sizeof(oldNotes)) {
+      for (int i = 0; i < NOTES_MAX; i++) {
+        notes[i].used = oldNotes[i].used;
+        notes[i].day = oldNotes[i].day;
+        notes[i].month = oldNotes[i].month;
+        notes[i].year = oldNotes[i].year;
+        memcpy(notes[i].text, oldNotes[i].text, sizeof(notes[i].text));
+        notes[i].reminderEnabled = oldNotes[i].reminderEnabled;
+        notes[i].reminderHour = oldNotes[i].reminderHour;
+        notes[i].reminderMinute = oldNotes[i].reminderMinute;
+        notes[i].reminderFiredDay = oldNotes[i].reminderFiredDay;
+        notes[i].reminderRepeats = 1;
+      }
+      migrated = true;
+    }
+  } else if (stored == sizeof(NoteLegacyV1) * NOTES_MAX) {
+    static NoteLegacyV1 oldNotes[NOTES_MAX];
+    if (p.getBytes("n", oldNotes, sizeof(oldNotes)) == sizeof(oldNotes)) {
+      for (int i = 0; i < NOTES_MAX; i++) {
+        notes[i].used = oldNotes[i].used;
+        notes[i].day = oldNotes[i].day;
+        notes[i].month = oldNotes[i].month;
+        notes[i].year = oldNotes[i].year;
+        memcpy(notes[i].text, oldNotes[i].text, sizeof(notes[i].text));
+        notes[i].reminderHour = 9;
+        notes[i].reminderRepeats = 1;
+      }
+      migrated = true;
+    }
+  }
   p.end();
-  for (int i = 0; i < NOTES_MAX; i++) notes[i].text[sizeof(notes[i].text) - 1] = '\0';
+  for (int i = 0; i < NOTES_MAX; i++) {
+    notes[i].text[sizeof(notes[i].text) - 1] = '\0';
+    if (notes[i].reminderHour > 23) notes[i].reminderHour = 9;
+    if (notes[i].reminderMinute > 59) notes[i].reminderMinute = 0;
+    if (notes[i].reminderRepeats < 1 || notes[i].reminderRepeats > 3) notes[i].reminderRepeats = 1;
+  }
+  if (migrated) notesSave();
 }
 
 inline void notesSave() {
@@ -52,6 +128,31 @@ inline void notesSave() {
   if (!p.begin("notes", false)) return;
   p.putBytes("n", notes, sizeof(notes));
   p.end();
+}
+
+// Викликається з loop незалежно від відкритого екрана.
+inline void notesReminderTick(unsigned long now) {
+  (void)now;
+  int y = year(), m = month(), d = day();
+  if (y < 2020 || m < 1 || m > 12 || d < 1 || d > 31) return;
+
+  uint32_t dayKey = (uint32_t)y * 10000UL + (uint32_t)m * 100UL + (uint32_t)d;
+  bool changed = false;
+  uint8_t requestedRepeats = 1;
+  for (int i = 0; i < NOTES_MAX; i++) {
+    Note& n = notes[i];
+    if (!n.used || !n.reminderEnabled || n.reminderFiredDay == dayKey) continue;
+    bool dateMatches = n.month == m && n.day == d && (n.year == 0 || n.year == y);
+    if (!dateMatches || hour() != n.reminderHour || minute() != n.reminderMinute) continue;
+    n.reminderFiredDay = dayKey;
+    if (n.reminderRepeats > requestedRepeats) requestedRepeats = n.reminderRepeats;
+    changed = true;
+  }
+  if (changed) {
+    notesSave();
+    if (requestedRepeats > notesBeepRepeatsRequest) notesBeepRepeatsRequest = requestedRepeats;
+    notesBeepRequest = true;
+  }
 }
 
 // ---------- допоміжні ----------
@@ -121,6 +222,10 @@ static int notesCollect(NoteView* v) {
     if (!notes[i].used) continue;
     long d = notesDaysUntil(notes[i]);
     if (notes[i].year != 0 && d < 0) continue;  // одноразова вже минула
+    // У день нагадування прибираємо його з головного рядка після заданого часу.
+    if (d == 0 && notes[i].reminderEnabled &&
+        (hour() > notes[i].reminderHour ||
+         (hour() == notes[i].reminderHour && minute() >= notes[i].reminderMinute))) continue;
     v[n].idx = i;
     v[n].days = d;
     n++;
@@ -138,23 +243,73 @@ static int notesCollect(NoteView* v) {
 }
 
 // ---------- календар на весь екран: рядки знизу ----------
-inline void notesDrawCalendar(int displayMonth) {
-  NoteView v[NOTES_MAX];
-  int n = notesCollect(v);
-  if (n > 3) n = 3;
-  if (n == 0) return;
-  tft.fillRect(0, 203, 320, 37, bgColor);  // стираємо підказку внизу
+inline int notesCountForCalendarMonth(int displayMonth, int displayYear) {
+  int count = 0;
+
+  for (int i = 0; i < NOTES_MAX; i++) {
+    if (!notes[i].used) continue;
+    if (notes[i].month != displayMonth) continue;
+
+    // Рік 0 означає щорічну замітку.
+    // Замітка з роком показується лише у відповідному році.
+    if (notes[i].year != 0 && notes[i].year != displayYear) continue;
+
+    count++;
+  }
+
+  return count;
+}
+
+inline void notesDrawCalendar(int displayMonth, int displayYear, int page) {
+  int items[NOTES_MAX];
+  int count = 0;
+
+  for (int i = 0; i < NOTES_MAX; i++) {
+    if (!notes[i].used) continue;
+    if (notes[i].month != displayMonth) continue;
+    if (notes[i].year != 0 && notes[i].year != displayYear) continue;
+
+    items[count++] = i;
+  }
+
+  if (count == 0) return;
+
+  // Сортуємо замітки місяця за числом.
+  for (int i = 1; i < count; i++) {
+    int item = items[i];
+    int j = i - 1;
+
+    while (j >= 0 && notes[items[j]].day > notes[item].day) {
+      items[j + 1] = items[j];
+      j--;
+    }
+
+    items[j + 1] = item;
+  }
+
+  int start = page * 3;
+  if (start >= count) start = 0;
+  int shown = count - start;
+  if (shown > 3) shown = 3;
+
+  tft.fillRect(0, 203, 320, 37, bgColor);
   u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
-  int y = 238 - (n - 1) * 12;
-  for (int i = 0; i < n; i++) {
-    const Note& nt = notes[v[i].idx];
-    char scr[80], line[110];
-    notesScreenText(nt.text, scr, sizeof(scr));
-    snprintf(line, sizeof(line), "%02d.%02d %s", nt.day, nt.month, scr);
+
+  int y = 238 - (shown - 1) * 12;
+
+  for (int i = 0; i < shown; i++) {
+    const Note& nt = notes[items[start + i]];
+    char text[80];
+    char line[110];
+
+    notesScreenText(nt.text, text, sizeof(text));
+    snprintf(line, sizeof(line), "%02d.%02d %s", nt.day, nt.month, text);
+
     u8g2Fonts.setBackgroundColor(bgColor);
-    u8g2Fonts.setForegroundColor(nt.month == displayMonth ? 0xFFE0 : 0x9517);  // жовтий — у цьому місяці
+    u8g2Fonts.setForegroundColor(0xFFE0);
     u8g2Fonts.setCursor(4, y);
     u8g2Fonts.print(line);
+
     y += 12;
   }
 }
@@ -291,7 +446,19 @@ static void notesPage() {
       snprintf(date, sizeof(date), "%02d.%02d", notes[i].day, notes[i].month);
     p += F("<div class=card><div class=date>");
     p += date;
-    p += F("</div><div class=note>");
+    p += F("</div>");
+    if (notes[i].reminderEnabled) {
+      char reminderTime[6];
+      snprintf(reminderTime, sizeof(reminderTime), "%02d:%02d", notes[i].reminderHour, notes[i].reminderMinute);
+      p += F("<div class=date>&#128276; ");
+      p += reminderTime;
+      if (notes[i].reminderRepeats > 1) {
+        p += F(" ×");
+        p += String(notes[i].reminderRepeats);
+      }
+      p += F("</div>");
+    }
+    p += F("<div class=note>");
     p += notesEsc(notes[i].text);
     p += F("</div><div class=actions><a href='/notes/edit?pin=");
     p += cfg.pin;
@@ -329,13 +496,17 @@ static void notesEditPage() {
   const Note& n = notes[idx];
   char date[16] = "";
   if (n.used) snprintf(date, sizeof(date), "%04d-%02d-%02d", n.year ? n.year : year(), n.month, n.day);
+  char reminderTime[6] = "09:00";
+  if (n.used && n.reminderEnabled)
+    snprintf(reminderTime, sizeof(reminderTime), "%02d:%02d", n.reminderHour, n.reminderMinute);
+  int reminderRepeats = n.used ? constrain((int)n.reminderRepeats, 1, 3) : 1;
 
   String p;
   p.reserve(2600);
   p += F("<!doctype html><html lang=uk><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
          "<title>&#1047;&#1072;&#1084;&#1110;&#1090;&#1082;&#1072;</title><style>:root{color-scheme:dark}body{font:16px system-ui,sans-serif;background:#0b1020;color:#e8ecf5;margin:0 auto;padding:16px;max-width:560px}"
          "h1{font-size:22px}.card{background:#101733;border-radius:14px;padding:6px 14px 14px;margin-top:12px}label{display:block;margin:12px 0 4px;font-size:13px;color:#9aa7c7}"
-         "input,select{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2a3558;background:#121a33;color:#fff;font-size:16px}"
+         "input,select{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2a3558;background:#121a33;color:#fff;font-size:16px}input[type=checkbox]{width:auto;vertical-align:middle;margin-right:8px}"
          "button{margin-top:18px;width:100%;padding:15px;border:0;border-radius:12px;background:#2f6bff;color:#fff;font-size:17px;font-weight:600}a{color:#8fb4ff}</style></head><body>");
   p += n.used ? F("<h1>&#1056;&#1077;&#1076;&#1072;&#1075;&#1091;&#1074;&#1072;&#1090;&#1080; &#1079;&#1072;&#1084;&#1110;&#1090;&#1082;&#1091;</h1>") : F("<h1>&#1053;&#1086;&#1074;&#1072; &#1079;&#1072;&#1084;&#1110;&#1090;&#1082;&#1072;</h1>");
   p += F("<form class=card method=post action=/notes/save><input type=hidden name=pin value='");
@@ -344,7 +515,19 @@ static void notesEditPage() {
   p += idx;
   p += F("'><label>&#1044;&#1072;&#1090;&#1072;</label><input type=date name=date required value='");
   p += date;
-  p += F("'><label>&#1055;&#1086;&#1074;&#1090;&#1086;&#1088;&#1102;&#1074;&#1072;&#1090;&#1080;</label><select name=repeat><option value=1");
+  p += F("'><label>&#1063;&#1072;&#1089; &#1085;&#1072;&#1075;&#1072;&#1076;&#1091;&#1074;&#1072;&#1085;&#1085;&#1103;</label><input type=time name=reminderTime value='");
+  p += reminderTime;
+  p += F("'><label><input type=checkbox name=remind value=1");
+  if (n.used && n.reminderEnabled) p += F(" checked");
+  p += F(">&#1059;&#1074;&#1110;&#1084;&#1082;&#1085;&#1091;&#1090;&#1080; &#1079;&#1074;&#1091;&#1082;&#1086;&#1074;&#1077; &#1085;&#1072;&#1075;&#1072;&#1076;&#1091;&#1074;&#1072;&#1085;&#1085;&#1103;</label>");
+  p += F("<label>&#1050;&#1110;&#1083;&#1100;&#1082;&#1110;&#1089;&#1090;&#1100; &#1089;&#1080;&#1075;&#1085;&#1072;&#1083;&#1110;&#1074;</label><select name=reminderRepeats><option value=1");
+  if (reminderRepeats == 1) p += F(" selected");
+  p += F(">1 &#1088;&#1072;&#1079;</option><option value=2");
+  if (reminderRepeats == 2) p += F(" selected");
+  p += F(">2 &#1088;&#1072;&#1079;&#1080;</option><option value=3");
+  if (reminderRepeats == 3) p += F(" selected");
+  p += F(">3 &#1088;&#1072;&#1079;&#1080;</option></select>"
+         "<label>&#1055;&#1086;&#1074;&#1090;&#1086;&#1088;&#1102;&#1074;&#1072;&#1090;&#1080; &#1076;&#1072;&#1090;&#1091;</label><select name=repeat><option value=1");
   if (!n.used || n.year == 0) p += F(" selected");
   p += F(">&#1065;&#1086;&#1088;&#1086;&#1082;&#1091; (&#1076;&#1077;&#1085;&#1100; &#1085;&#1072;&#1088;&#1086;&#1076;&#1078;&#1077;&#1085;&#1085;&#1103;)</option><option value=0");
   if (n.used && n.year != 0) p += F(" selected");
@@ -365,12 +548,24 @@ static void notesSaveHandler() {
   int idx = webServer.arg("id").toInt();
   String date = webServer.arg("date");
   String text = webServer.arg("text");
+  String reminderTime = webServer.arg("reminderTime");
+  bool reminderEnabled = webServer.arg("remind") == "1";
+  int reminderRepeats = webServer.arg("reminderRepeats").toInt();
+  if (reminderRepeats == 0) reminderRepeats = 1;  // сумісність зі старою відкритою формою
   text.trim();
   int y = 0, m = 0, d = 0;
+  int reminderHour = 9, reminderMinute = 0;
+  bool reminderTimeValid = true;
+  if (reminderEnabled) {
+    reminderTimeValid = reminderTime.length() == 5 &&
+                        sscanf(reminderTime.c_str(), "%d:%d", &reminderHour, &reminderMinute) == 2 &&
+                        reminderHour >= 0 && reminderHour <= 23 && reminderMinute >= 0 && reminderMinute <= 59;
+  }
   bool valid = idx >= 0 && idx < NOTES_MAX &&
                sscanf(date.c_str(), "%d-%d-%d", &y, &m, &d) == 3 &&
                y >= 2000 && y <= 2100 && m >= 1 && m <= 12 &&
-               d >= 1 && d <= notesDim(y, m) && text.length() > 0;
+               d >= 1 && d <= notesDim(y, m) && text.length() > 0 && reminderTimeValid &&
+               reminderRepeats >= 1 && reminderRepeats <= 3;
   if (!valid) {
     webServer.send(400, "text/plain; charset=utf-8", "Invalid note");
     return;
@@ -380,6 +575,10 @@ static void notesSaveHandler() {
   notes[idx].day = (uint8_t)d;
   notes[idx].month = (uint8_t)m;
   notes[idx].year = webServer.arg("repeat").toInt() ? 0 : (uint16_t)y;
+  notes[idx].reminderEnabled = reminderEnabled ? 1 : 0;
+  notes[idx].reminderHour = (uint8_t)reminderHour;
+  notes[idx].reminderMinute = (uint8_t)reminderMinute;
+  notes[idx].reminderRepeats = (uint8_t)reminderRepeats;
   cfgCopyUtf8(notes[idx].text, sizeof(notes[idx].text), text.c_str());
   notesSave();
   tkLastCalc = 0;
