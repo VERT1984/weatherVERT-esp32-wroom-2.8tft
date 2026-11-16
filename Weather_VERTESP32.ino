@@ -78,7 +78,12 @@
 
 int bgR = 0, bgG = 0, bgB = 40;
 int bgAR = 0, bgAG = 0, bgAB = 40;
+int mainBgR = 0, mainBgG = 0, mainBgB = 40;
 uint16_t bgColor = RGB565(0, 0, 40);
+uint16_t calendarBgColor = RGB565(0, 0, 40);
+uint16_t weatherBgColor = RGB565(0, 0, 40);
+uint16_t clockBgColor = RGB565(0, 0, 40);
+uint8_t bgTarget = 0;  // 0=загальний, 1=календар, 2=погода, 3=годинник
 #define BACKGROUND_COLOR bgColor
 
 #define TIME_Y 60
@@ -235,6 +240,8 @@ void drawBgScreen();
 void drawBgSlider(int ch);
 void drawBgPreview();
 void setBgFromTouch(int sx, int sy);
+static void loadBgTarget();
+static void saveBgTarget();
 void drawAlertHist();
 void loadAlertLog();
 void drawWifiConfigScreen(const char* portalPassword, bool manual);
@@ -403,6 +410,7 @@ struct HrItem {
 HrItem hrCache[5];
 int hrCount = 0;
 bool hourlyScreen = false;
+bool forecastGraphScreen = false;
 
 void displayForecastItem(int index, const char* condition, int tempMin, int tempMax, const char* dayName) {
   if (index >= 0 && index < 5) {
@@ -455,6 +463,7 @@ void displayCalendar() {
 }
 
 void displayCalendarFullscreen(int displayMonth, int displayYear) {
+  bgColor = calendarBgColor;
   tft.fillScreen(BACKGROUND_COLOR);
   int dim = daysInMonth(displayYear, displayMonth);
   const char* monthNames[] = {
@@ -539,15 +548,31 @@ void showNoInternet() {
   drawTextCentered(160, 110, "Пiдключiть до iнтернету", RED, BACKGROUND_COLOR);
 }
 
+static void drawBootConnectingDots(uint8_t dots) {
+  static const char* frames[4] = {"CONNECTING", "CONNECTING.", "CONNECTING..", "CONNECTING..."};
+  tft.fillRect(48, 145, 224, 36, BACKGROUND_COLOR);
+  u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
+  drawTextCentered(160, 170, frames[dots & 3], CYAN, BACKGROUND_COLOR);
+}
+
+// Кожен звук — пара {тривалість мс, частота Гц}; частота 0 означає паузу.
 const uint16_t BEEP_ALERT[] = {
-  150, 150, 150, 150, 150, 450,
-  450, 150, 450, 150, 450, 450,
-  150, 150, 150, 150, 150, 0
+  150, BUZZER_FREQ, 150, 0, 150, BUZZER_FREQ, 150, 0, 150, BUZZER_FREQ, 450, 0,
+  450, BUZZER_FREQ, 150, 0, 450, BUZZER_FREQ, 150, 0, 450, BUZZER_FREQ, 450, 0,
+  150, BUZZER_FREQ, 150, 0, 150, BUZZER_FREQ, 150, 0, 150, BUZZER_FREQ, 0, 0
 };
-const uint16_t BEEP_CLEAR[] = { 1500, 0 };
+const uint16_t BEEP_CLEAR[] = {1500, BUZZER_FREQ, 0, 0};
+// Короткий висхідний сигнал підключення: чотири тони з короткими паузами.
+const uint16_t BEEP_WIFI_CONNECTED[] = {85, 660, 65, 0, 85, 880, 65, 0, 100, 1175, 65, 0, 150, 1568, 0, 0};
+const uint16_t BEEP_NOTE_REMINDER[] = {180, 784, 100, 0, 180, 988, 100, 0, 220, 1175, 100, 0, 350, 1568, 0, 0};
 const uint16_t* beepPat = nullptr;
 int beepIdx = 0;
 unsigned long beepNext = 0;
+volatile bool wifiConnectedBeepPending = false;
+volatile bool wifiRememberGoodPending = false;
+volatile bool notesBeepRequest = false;
+volatile uint8_t notesBeepRepeatsRequest = 1;
+uint8_t beepRepeatLeft = 1;
 bool minuteSilenceActive = false, minuteSilencePulse = false;
 unsigned long minuteSilenceEndsAt = 0, minuteSilenceNextAt = 0, minuteSilencePulseEndsAt = 0;
 uint32_t minuteSilenceDayKey = 0;
@@ -596,12 +621,12 @@ char lastWifiEvent[56] = "-";
 
 const char* wifiDiscWhy(uint8_t r) {
   switch (r) {
-    case WIFI_REASON_AUTH_EXPIRE: return "роутер скинув сесiю";
-    case WIFI_REASON_AUTH_LEAVE: return "роутер вiдключив";
+    case WIFI_REASON_AUTH_EXPIRE: return "тайм-аут автентифiкацiї / причина AP";
+    case WIFI_REASON_AUTH_LEAVE: return "AP надiслав вiд'єднання";
     case WIFI_REASON_ASSOC_EXPIRE: return "сесiя прострочена";
     case WIFI_REASON_ASSOC_LEAVE: return "штатний disconnect";
     case WIFI_REASON_AUTH_FAIL: return "пароль / auth";
-    case WIFI_REASON_NO_AP_FOUND: return "AP не видно (антена)";
+    case WIFI_REASON_NO_AP_FOUND: return "AP не знайдений пiд час connect";
     case WIFI_REASON_BEACON_TIMEOUT: return "немає маякiв AP (сигнал/живлення)";
     case WIFI_REASON_HANDSHAKE_TIMEOUT: return "handshake timeout";
     case WIFI_REASON_CONNECTION_FAIL: return "не вдалось з'єднатись";
@@ -614,17 +639,19 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     uint8_t r = info.wifi_sta_disconnected.reason;
     lastWifiDiscReason = r;
     snprintf(lastWifiEvent, sizeof(lastWifiEvent), "%u %s", r, wifiDiscWhy(r));
-    Serial.printf("[WiFi] DISCONNECT reason=%u (%s) RSSI=%d heap=%u\n",
-                  r, wifiDiscWhy(r), WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
+    Serial.printf("[WiFi] DISCONNECT reason=%u (%s) RSSI=недоступний heap=%u\n",
+                  r, wifiDiscWhy(r), (unsigned)ESP.getFreeHeap());
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
     Serial.printf("[WiFi] GOT_IP %s RSSI=%d dBm\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    wifiConnectedBeepPending = true;
+    wifiRememberGoodPending = true;
   }
 }
 
-void buzzOn() {
+void buzzOn(uint16_t frequencyHz) {
   if (BUZZER_ACTIVE) digitalWrite(BUZZER_PIN, HIGH);
-  else { ledcWriteTone(BUZZER_PIN, BUZZER_FREQ); ledcWrite(BUZZER_PIN, 128); }
+  else { ledcWriteTone(BUZZER_PIN, frequencyHz); ledcWrite(BUZZER_PIN, 128); }
 }
 
 void buzzOff() {
@@ -632,25 +659,34 @@ void buzzOff() {
   else { ledcWriteTone(BUZZER_PIN, 0); ledcWrite(BUZZER_PIN, 0); }
 }
 
-void startBeep(const uint16_t* pat) {
+void startBeep(const uint16_t* pat, uint8_t repeats) {
   beepPat = pat;
   beepIdx = 0;
   beepNext = 0;
+  beepRepeatLeft = constrain(repeats, 1, 3);
 }
 
 void beepTick() {
   if (!beepPat) return;
   unsigned long n = millis();
   if (n < beepNext) return;
-  uint16_t d = beepPat[beepIdx];
-  if (d == 0) {
+  uint16_t durationMs = beepPat[beepIdx * 2];
+  uint16_t frequencyHz = beepPat[beepIdx * 2 + 1];
+  if (durationMs == 0) {
     buzzOff();
+    if (beepRepeatLeft > 1) {
+      beepRepeatLeft--;
+      beepIdx = 0;
+      beepNext = n + 250UL;
+      return;
+    }
     beepPat = nullptr;
+    beepRepeatLeft = 0;
     return;
   }
-  if (beepIdx % 2 == 0) buzzOn();
-  else buzzOff();
-  beepNext = n + d;
+  if (frequencyHz == 0) buzzOff();
+  else buzzOn(frequencyHz);
+  beepNext = n + durationMs;
   beepIdx++;
 }
 
@@ -1192,6 +1228,7 @@ void minuteSilenceTick(unsigned long now) {
 
 bool alarmActive = false;
 int alarmKind = 0;
+bool alarmDisplayYellow = false;
 unsigned long alarmStartMs = 0;
 
 void drawWrappedCentered(const char* text, int cx, int y, int lineH, int maxW, uint16_t fg, uint16_t bg) {
@@ -1217,8 +1254,9 @@ void drawWrappedCentered(const char* text, int cx, int y, int lineH, int maxW, u
 }
 
 void drawAlarmFrame(bool inv) {
-  uint16_t bg = (alarmKind == 1) ? (inv ? BLACK : RED) : DARKGREEN;
-  uint16_t fg = (alarmKind == 1) ? (inv ? RED : WHITE) : WHITE;
+  uint16_t activeBg = alarmDisplayYellow ? YELLOW : RED;
+  uint16_t bg = (alarmKind == 1) ? (inv ? BLACK : activeBg) : DARKGREEN;
+  uint16_t fg = (alarmKind == 1) ? (inv ? activeBg : (alarmDisplayYellow ? BLACK : WHITE)) : WHITE;
   tft.fillScreen(bg);
 
   u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
@@ -1234,6 +1272,7 @@ void drawAlarmFrame(bool inv) {
 
 void startAlarmScreen(int kind) {
   alarmKind = kind;
+  alarmDisplayYellow = (kind == 1 && alertState == 3);
   alarmActive = true;
   alarmStartMs = millis();
   ledcWrite(BL_PIN, BL_INVERT ? 0 : 255);
@@ -1243,6 +1282,13 @@ void startAlarmScreen(int kind) {
 #define ALARM_DURATION 5000UL
 
 void alarmTick(unsigned long now) {
+  if (alarmKind == 1 && (alertState == 2 || alertState == 3)) {
+    bool yellow = (alertState == 3);
+    if (yellow != alarmDisplayYellow) {
+      alarmDisplayYellow = yellow;
+      drawAlarmFrame(false);  // екран і світлодіод змінюють рівень синхронно
+    }
+  }
   if (now - alarmStartMs >= ALARM_DURATION) {
     alarmActive = false;
     applyBrightness();
@@ -1513,6 +1559,8 @@ void closeWifiConfigPortal() {
   wpStop();
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   wifiPortalActive = false;
   wifiPortalStartedMs = 0;
   if (ok) {
@@ -1624,9 +1672,8 @@ void handleMenuTap(int sx, int sy) {
       drawSystem();
     } else if (inRect(sx, sy, MENU_COL1_X, MENU_ROW2_Y, MENU_COL1_X + MENU_COL_W, MENU_ROW2_Y + MENU_ITEM_H)) {
       menuState = 4;
-      bgR = bgAR;
-      bgG = bgAG;
-      bgB = bgAB;
+      bgTarget = 0;
+      loadBgTarget();
       drawBgScreen();
     } else if (inRect(sx, sy, MENU_COL2_X, MENU_ROW2_Y, MENU_COL2_X + MENU_COL_W, MENU_ROW2_Y + MENU_ITEM_H)) {
       menuState = 5;
@@ -1654,18 +1701,19 @@ void handleMenuTap(int sx, int sy) {
       drawMenu();
     }
   } else if (menuState == 4) {
-    if (inRect(sx, sy, 4, 190, 94, 232)) {
+    if (inRect(sx, sy, 0, 27, 320, 52)) {
+      bgTarget = constrain(sx / 80, 0, 3);
+      loadBgTarget();
+      drawBgScreen();
+    } else if (inRect(sx, sy, 4, 190, 94, 232)) {
       bgR = 0;
       bgG = 0;
       bgB = 40;
+      bgAR = bgR; bgAG = bgG; bgAB = bgB;
       for (int ch = 0; ch < 3; ch++) drawBgSlider(ch);
       drawBgPreview();
     } else if (inRect(sx, sy, 98, 190, 232, 232)) {
-      bgAR = bgR;
-      bgAG = bgG;
-      bgAB = bgB;
-      bgColor = RGB565(bgR, bgG, bgB);
-      saveBg();
+      saveBgTarget();
       menuState = 0;
       returnToMain();
     } else if (inRect(sx, sy, 236, 190, 316, 232)) {
@@ -1871,15 +1919,47 @@ void loadBg() {
   bgAR = bgR;
   bgAG = bgG;
   bgAB = bgB;
+  mainBgR = bgR; mainBgG = bgG; mainBgB = bgB;
   bgColor = RGB565(bgR, bgG, bgB);
+  calendarBgColor = cfgLoadScreenBg("calBg", bgColor);
+  uint16_t oldWeatherBg = cfgLoadScreenBg("graphBg", cfgLoadScreenBg("hourBg", bgColor));
+  weatherBgColor = cfgLoadScreenBg("weatherBg", oldWeatherBg);
+  clockBgColor = cfgLoadScreenBg("clockBg", bgColor);
 }
 
 void saveBg() {
   cfgSaveBg(bgR, bgG, bgB);
 }
 
+static void loadBgTarget() {
+  if (bgTarget == 0) {
+    bgR = mainBgR; bgG = mainBgG; bgB = mainBgB;
+  } else {
+    uint16_t c = bgTarget == 1 ? calendarBgColor : bgTarget == 2 ? weatherBgColor : clockBgColor;
+    bgR = ((c >> 11) & 0x1F) * 255 / 31;
+    bgG = ((c >> 5) & 0x3F) * 255 / 63;
+    bgB = (c & 0x1F) * 255 / 31;
+  }
+  bgAR = bgR; bgAG = bgG; bgAB = bgB;
+}
+
+static void saveBgTarget() {
+  uint16_t c = RGB565(bgR, bgG, bgB);
+  if (bgTarget == 0) {
+    mainBgR = bgR; mainBgG = bgG; mainBgB = bgB;
+    bgColor = c;
+    saveBg();
+  } else if (bgTarget == 1) {
+    calendarBgColor = c; cfgSaveScreenBg("calBg", c);
+  } else if (bgTarget == 2) {
+    weatherBgColor = c; cfgSaveScreenBg("weatherBg", c);
+  } else {
+    clockBgColor = c; cfgSaveScreenBg("clockBg", c);
+  }
+}
+
 void drawBgSlider(int ch) {
-  int y = 40 + ch * 40;
+  int y = 58 + ch * 32;
   int val = (ch == 0) ? bgR : (ch == 1) ? bgG
                                         : bgB;
   uint16_t col = (ch == 0) ? RED : (ch == 1) ? GREEN
@@ -1910,9 +1990,19 @@ void drawBgPreview() {
 }
 
 void drawBgScreen() {
+  bgColor = RGB565(mainBgR, mainBgG, mainBgB);  // редактор лишається на загальному фоні
   tft.fillScreen(bgColor);
   u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
-  drawTextCentered(160, 22, "Колiр фону", CYAN, bgColor);
+  drawTextCentered(160, 20, "Колiр фону", CYAN, bgColor);
+  static const char* tabs[4] = { "Загальний", "Календар", "Погода", "Годинник" };
+  for (int i = 0; i < 4; i++) {
+    int x = i * 80;
+    uint16_t tab = (i == bgTarget) ? RGB565(35, 82, 125) : RGB565(28, 37, 58);
+    tft.fillRoundRect(x + 1, 27, 78, 24, 4, tab);
+    tft.drawRoundRect(x + 1, 27, 78, 24, 4, (i == bgTarget) ? CYAN : GREY);
+    u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
+    drawTextCentered(x + 40, 44, tabs[i], WHITE, tab);
+  }
   for (int ch = 0; ch < 3; ch++) drawBgSlider(ch);
   drawBgPreview();
 
@@ -1927,7 +2017,7 @@ void drawBgScreen() {
 
 void setBgFromTouch(int sx, int sy) {
   for (int ch = 0; ch < 3; ch++) {
-    int y = 40 + ch * 40;
+    int y = 58 + ch * 32;
     if (sy >= y - 4 && sy <= y + 28) {
       int x = constrain(sx, 32, 248);
       int value = map(x, 32, 248, 0, 255);
@@ -1942,6 +2032,7 @@ void setBgFromTouch(int sx, int sy) {
 }
 
 void drawHourly() {
+  bgColor = weatherBgColor;
   tft.fillScreen(BACKGROUND_COLOR);
   u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
   drawTextCentered(160, 28, "Прогноз по годинах", CYAN, BACKGROUND_COLOR);
@@ -1962,6 +2053,68 @@ void drawHourly() {
     drawText(x + (IMG_WIDTH - tw) / 2, 160, buf, GREEN, BACKGROUND_COLOR);
   }
   drawTextCentered(160, 232, "тап   назад", GREY, BACKGROUND_COLOR);
+}
+
+void drawForecastGraph() {
+  bgColor = weatherBgColor;
+  const uint16_t dayColor = RGB565(255, 166, 70);
+  const uint16_t nightColor = RGB565(86, 190, 255);
+  const uint16_t gridColor = RGB565(53, 67, 91);
+  tft.fillScreen(BACKGROUND_COLOR);
+  u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
+  drawTextCentered(160, 26, "Температура на 5 днів", CYAN, BACKGROUND_COLOR);
+  u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
+  tft.fillCircle(93, 43, 3, dayColor);
+  drawText(101, 47, "День", dayColor, BACKGROUND_COLOR);
+  tft.fillCircle(183, 43, 3, nightColor);
+  drawText(191, 47, "Ніч", nightColor, BACKGROUND_COLOR);
+
+  if (fcCount <= 0) {
+    drawTextCentered(160, 126, "Немає даних прогнозу", GREY, BACKGROUND_COLOR);
+    drawTextCentered(160, 232, "тап — назад", GREY, BACKGROUND_COLOR);
+    return;
+  }
+
+  int low = fcCache[0].tmin, high = fcCache[0].tmax;
+  for (int i = 1; i < fcCount; i++) {
+    low = min(low, fcCache[i].tmin);
+    high = max(high, fcCache[i].tmax);
+  }
+  if (high - low < 4) { low -= 2; high += 2; }
+  else { low--; high++; }
+
+  const int graphTop = 64, graphBottom = 168;
+  const int graphLeft = 34, graphRight = 300;
+  for (int g = 0; g <= 4; g++) {
+    int y = graphTop + (graphBottom - graphTop) * g / 4;
+    int value = high - (high - low) * g / 4;
+    tft.drawFastHLine(graphLeft, y, graphRight - graphLeft, gridColor);
+    char label[8];
+    snprintf(label, sizeof(label), "%d°", value);
+    drawText(2, y + 4, label, GREY, BACKGROUND_COLOR);
+  }
+
+  int px[5], pyDay[5], pyNight[5];
+  for (int i = 0; i < fcCount; i++) {
+    px[i] = (fcCount == 1) ? (graphLeft + graphRight) / 2
+                            : graphLeft + 10 + i * (graphRight - graphLeft - 20) / (fcCount - 1);
+    pyDay[i] = graphBottom - (fcCache[i].tmax - low) * (graphBottom - graphTop) / (high - low);
+    pyNight[i] = graphBottom - (fcCache[i].tmin - low) * (graphBottom - graphTop) / (high - low);
+    if (i > 0) {
+      tft.drawLine(px[i - 1], pyDay[i - 1], px[i], pyDay[i], dayColor);
+      tft.drawLine(px[i - 1], pyNight[i - 1], px[i], pyNight[i], nightColor);
+    }
+    tft.drawLine(px[i], pyDay[i], px[i], pyNight[i], RGB565(110, 120, 145));
+    tft.fillCircle(px[i], pyDay[i], 4, dayColor);
+    tft.fillCircle(px[i], pyNight[i], 4, nightColor);
+    char value[8];
+    snprintf(value, sizeof(value), "%d°", fcCache[i].tmax);
+    drawTextCentered(px[i], pyDay[i] - 6, value, dayColor, BACKGROUND_COLOR);
+    snprintf(value, sizeof(value), "%d°", fcCache[i].tmin);
+    drawTextCentered(px[i], pyNight[i] + 15, value, nightColor, BACKGROUND_COLOR);
+    drawTextCentered(px[i], 190, fcCache[i].name, WHITE, BACKGROUND_COLOR);
+  }
+  drawTextCentered(160, 232, "тап — назад", GREY, BACKGROUND_COLOR);
 }
 
 // Рядок тісного списку (крок 13 пікс.)
@@ -2006,6 +2159,7 @@ void drawAqiLine() {
 }
 
 void redrawMain() {
+  bgColor = RGB565(mainBgR, mainBgG, mainBgB);
   tft.fillScreen(BACKGROUND_COLOR);
   u8g2Fonts.setFont(u8g2_font_6x13_t_cyrillic);
   if (strlen(lastTemperature) > 0) {
@@ -2142,12 +2296,11 @@ static void restoreDialDetailsOnOldHands(int cx, int cy, int hx, int hy,
 static void drawAnalogDial() {
   const int cx = 160;
   const int cy = 120;
-  const uint16_t navy = RGB565(7, 18, 38);
   const uint16_t dial = RGB565(10, 27, 52);
   const uint16_t silver = RGB565(190, 202, 214);
   const uint16_t tick = RGB565(115, 145, 177);
 
-  tft.fillScreen(navy);
+  tft.fillScreen(BACKGROUND_COLOR);
   // Великий металевий обідок майже на всю висоту екрана.
   tft.fillCircle(cx, cy, 119, RGB565(80, 96, 116));
   tft.drawCircle(cx, cy, 118, WHITE);
@@ -2309,7 +2462,7 @@ static void drawClockDigitalFull(bool force) {
   if (!ptm) return;
 
   if (force || !screenDrawn) {
-    tft.fillScreen(RGB565(7, 18, 38));
+    tft.fillScreen(BACKGROUND_COLOR);
     lastHour[0] = '\0';
     lastMinute[0] = '\0';
     lastDate[0] = '\0';
@@ -2319,7 +2472,7 @@ static void drawClockDigitalFull(bool force) {
     screenDrawn = true;
   }
 
-  const uint16_t bg = RGB565(7, 18, 38);
+  const uint16_t bg = BACKGROUND_COLOR;
   const uint16_t fg = RGB565(235, 241, 245);
   char hourText[3], minuteText[3], secondText[3];
   snprintf(hourText, sizeof(hourText), "%02d", ptm->tm_hour);
@@ -2438,6 +2591,7 @@ static void drawClockDigitalFull(bool force) {
 }
 
 void drawClockFull(bool force) {
+  bgColor = clockBgColor;
   if (clockAnalogView) drawClockAnalogFull(force);
   else drawClockDigitalFull(force);
   if (force) drawClockViewButton();
@@ -2445,6 +2599,7 @@ void drawClockFull(bool force) {
 void restoreAfterAlarm() {
   if (calendarFullscreen) displayCalendarFullscreen(calDisplayMonth, calDisplayYear);
   else if (clockFullscreen) { tft.fillScreen(BACKGROUND_COLOR); drawClockFull(true); }
+  else if (forecastGraphScreen) drawForecastGraph();
   else if (alertHistScreen) drawAlertHist();
   else if (hourlyScreen) drawHourly();
   else if (menuState == 5) drawAlertMap(true);
@@ -2548,7 +2703,9 @@ void updateWeather(unsigned long now) {
         int hrFill = 0;
         hrCount = 0;
         int dayCount = 0;
-        float dayMin = 1000.0f, dayMax = -1000.0f;
+        fcCount = 0;
+        float allMin = 1000.0f, allMax = -1000.0f;
+        float nightMin = 1000.0f, daytimeMax = -1000.0f;
         char dayCond[16] = "";
         int bestCondPrio = -1;
         time_t firstDtOfDay = 0;
@@ -2576,24 +2733,29 @@ void updateWeather(unsigned long now) {
           if (strcmp(dateBuf, todayStr) == 0) continue;
 
           float tmp = item["main"]["temp"].as<float>();
+          const char* partOfDay = item["sys"]["pod"] | "d";
           char cond[16];
           strlcpy(cond, item["weather"][0]["main"] | "", sizeof(cond));
 
           if (lastDate[0] != '\0' && strcmp(dateBuf, lastDate) != 0) {
             time_t firstLocal = firstDtOfDay + tz;
             tm* outTm = gmtime(&firstLocal);
-            displayForecastItem(dayCount++, dayCond, (int)round(dayMin), (int)round(dayMax),
+            int nightValue = (nightMin < 999.0f) ? (int)round(nightMin) : (int)round(allMin);
+            int dayValue = (daytimeMax > -999.0f) ? (int)round(daytimeMax) : (int)round(allMax);
+            displayForecastItem(dayCount++, dayCond, nightValue, dayValue,
                                 shortDayName(outTm->tm_wday));
-            dayMin = 1000.0f;
-            dayMax = -1000.0f;
+            allMin = nightMin = 1000.0f;
+            allMax = daytimeMax = -1000.0f;
             bestCondPrio = -1;
           }
           if (lastDate[0] == '\0' || strcmp(dateBuf, lastDate) != 0) {
             strlcpy(lastDate, dateBuf, sizeof(lastDate));
             firstDtOfDay = dt;
           }
-          if (tmp < dayMin) dayMin = tmp;
-          if (tmp > dayMax) dayMax = tmp;
+          if (tmp < allMin) allMin = tmp;
+          if (tmp > allMax) allMax = tmp;
+          if (partOfDay[0] == 'n' && tmp < nightMin) nightMin = tmp;
+          if (partOfDay[0] == 'd' && tmp > daytimeMax) daytimeMax = tmp;
           int prio = condPriority(cond);
           if (prio > bestCondPrio) {
             bestCondPrio = prio;
@@ -2604,7 +2766,9 @@ void updateWeather(unsigned long now) {
         if (dayCount < 5 && lastDate[0] != '\0') {
           time_t firstLocal = firstDtOfDay + tz;
           tm* outTm = gmtime(&firstLocal);
-          displayForecastItem(dayCount, dayCond, (int)round(dayMin), (int)round(dayMax),
+          int nightValue = (nightMin < 999.0f) ? (int)round(nightMin) : (int)round(allMin);
+          int dayValue = (daytimeMax > -999.0f) ? (int)round(daytimeMax) : (int)round(allMax);
+          displayForecastItem(dayCount, dayCond, nightValue, dayValue,
                               shortDayName(outTm->tm_wday));
         }
       }
@@ -2681,17 +2845,18 @@ void setup() {
   tft.setRotation(1);
   tft.fillScreen(BACKGROUND_COLOR);
 
-  u8g2Fonts.setFont(u8g2_font_10x20_t_cyrillic);
-  drawText(40, 110, "Made by V E R T", CYAN, BACKGROUND_COLOR);
-  delay(1500);
-  tft.fillScreen(BACKGROUND_COLOR);
-
+  u8g2Fonts.setFont(u8g2_font_inr30_t_cyrillic);
+  drawTextCentered(160, 128, "CODE BY VERT", CYAN, BACKGROUND_COLOR);
+  drawBootConnectingDots(0);
+ 
   // ── СТАБІЛЬНИЙ СТАРТ WI-FI З МАКСИМАЛЬНОЮ ПОТУЖНІСТЮ ──
   WiFi.onEvent(onWiFiEvent);
   WiFi.mode(WIFI_STA);
   WiFi.persistent(true);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 
   // Примусово вмикаємо максимальну потужність передавача для пробиття перешкод
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
@@ -2700,13 +2865,35 @@ void setup() {
   // Пауза для стабілізації радіомодуля в ядрі 3.x
   delay(300);
 
-  WiFi.begin();
+  String lastGoodSsid, lastGoodPassword;
+  if (wpLoadLastGoodNetwork(lastGoodSsid, lastGoodPassword)) {
+    Serial.printf("[wifi] запуск з останньою робочою мережею SSID='%s'\n", lastGoodSsid.c_str());
+    WiFi.begin(lastGoodSsid.c_str(), lastGoodPassword.c_str());
+  } else {
+    WiFi.begin();  // сумісність зі збереженою мережею до появи резервного запису
+    String legacySsid = WiFi.SSID();
+    if (legacySsid.length()) {
+      wpSaveLastGoodNetwork(legacySsid, WiFi.psk());
+      Serial.printf("[wifi] перенесено старі дані мережі SSID='%s' у резерв\n", legacySsid.c_str());
+    }
+  }
 
+  unsigned long lastSplashAnim = millis();
+  uint8_t splashDots = 0;
   unsigned long startAttemptTime = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < (WIFI_CONNECT_TIMEOUT * 1000UL)) {
-    delay(200);
+    if (millis() - lastSplashAnim >= 450UL) {
+      lastSplashAnim = millis();
+      splashDots = (splashDots + 1) & 3;
+      drawBootConnectingDots(splashDots);
+    }
+    delay(40);
   }
   bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected) {
+    wpRememberConnectedNetwork();
+    wifiRememberGoodPending = false;
+  }
 
   if (!connected) {
     snprintf(bootPortalPass, sizeof(bootPortalPass), "W%08lX", (unsigned long)esp_random());
@@ -2715,6 +2902,8 @@ void setup() {
     unsigned long t0 = millis();
     while (millis() - t0 < 600000UL) {
       if (wpLoop() == WP_OK) {
+        wpRememberConnectedNetwork();
+        wifiRememberGoodPending = false;
         connected = true;
         break;
       }
@@ -2728,8 +2917,6 @@ void setup() {
     delay(15000);
     restartWithReason("немає Wi-Fi при стартi");
   }
-
-  tft.fillScreen(BACKGROUND_COLOR);
 
   ts.begin();
   ts.setRotation(1);
@@ -2745,9 +2932,7 @@ void setup() {
   calDisplayMonth = month();
   calDisplayYear = currentYear;
 
-  displayCalendar();
-  
-  drawMenuButton();
+  returnToMain();  // заставка замінюється головним екраном без порожньої паузи
 
   xTaskCreatePinnedToCore(alertTask, "alert", 16384, NULL, 1, &alertTaskHandle, 0);
   if (!cfgComplete()) {
@@ -2759,8 +2944,13 @@ void setup() {
 void loop() {
   delay(2);
   unsigned long now = millis();
+  if (wifiRememberGoodPending) {
+    wifiRememberGoodPending = false;
+    wpRememberConnectedNetwork();
+  }
   featuresTick(now);  // світлодіод, нічний режим, автояскравість
   webLoop();  // обслуговуємо веб навіть під час тривоги
+  notesReminderTick(now);  // нагадування працюють на будь-якому відкритому екрані
   minuteSilenceTick(now);
 
   if (alarmActive) {
@@ -2797,11 +2987,22 @@ void loop() {
   if (alertEvent && !wifiPortalActive && menuState != 7 && !webConfigBusy()) {
     int ev = alertEvent;
     alertEvent = 0;
-    if (ev == 1) startBeep(BEEP_ALERT);
-    else if (!featuresIsNight()) startBeep(BEEP_CLEAR);  // вночі відбій без звуку
+    if (ev == 1) startBeep(BEEP_ALERT, 1);
+    else if (!featuresIsNight()) startBeep(BEEP_CLEAR, 1);  // вночі відбій без звуку
     if (!wifiPortalActive) {
       startAlarmScreen(ev);
       return;  // ВАЖЛИВО: у цьому проході більше нічого не малюємо поверх екрана тривоги
+    }
+  }
+  if (!alarmActive && !beepPat && !minuteSilenceActive) {
+    if (notesBeepRequest) {
+      notesBeepRequest = false;
+      uint8_t repeats = constrain((int)notesBeepRepeatsRequest, 1, 3);
+      notesBeepRepeatsRequest = 0;
+      startBeep(BEEP_NOTE_REMINDER, repeats);
+    } else if (wifiConnectedBeepPending) {
+      wifiConnectedBeepPending = false;
+      startBeep(BEEP_WIFI_CONNECTED, 1);
     }
   }
   beepTick();
@@ -2936,6 +3137,9 @@ void loop() {
       } else if (hourlyScreen) {
         hourlyScreen = false;
         returnToMain();
+      } else if (forecastGraphScreen) {
+        forecastGraphScreen = false;
+        returnToMain();
       } else if (menuState != 0) {
         sysLastSy = -1;
         int sx, sy;
@@ -2962,6 +3166,9 @@ void loop() {
           cfDate[0] = '\0';
           tft.fillScreen(BACKGROUND_COLOR);
           drawClockFull(true);
+        } else if (sy >= FORECAST_Y && fcCount > 0) {
+          forecastGraphScreen = true;
+          drawForecastGraph();
         } else if (inRect(sx, sy, WX_X1, WX_Y1, WX_X2, WX_Y2)) {
           hourlyScreen = true;
           drawHourly();
@@ -2993,7 +3200,7 @@ void loop() {
     lastWeatherUpdate = 0;
     featuresRecheck();  // нічний режим / автояскравість застосувати одразу
     shownAlertState = -1;
-    bool onMain = (menuState == 0 && !calendarFullscreen && !clockFullscreen && !alertHistScreen && !hourlyScreen && !alarmActive);
+    bool onMain = (menuState == 0 && !calendarFullscreen && !clockFullscreen && !alertHistScreen && !hourlyScreen && !forecastGraphScreen && !alarmActive);
     if (menuState == 7 && cfgComplete()) {
       menuState = 0;
       webConfigSessionActive = false;
@@ -3014,7 +3221,7 @@ void loop() {
 
   updateAlertMapIfNeeded();
 
-  if (calendarFullscreen || menuState != 0 || hourlyScreen || alertHistScreen) return;
+  if (calendarFullscreen || menuState != 0 || hourlyScreen || alertHistScreen || forecastGraphScreen) return;
 
   if (clockFullscreen) {
     if (now - lastTimeDraw >= 200) {
